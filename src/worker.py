@@ -114,11 +114,11 @@ def ensure_model_loaded(
     target_model_name: str,
 ) -> Tuple[Any, str]:
     if current_model_name == target_model_name and current_llm is not None:
-        logger.info("Reusing already loaded model: %s", current_model_name)
+        logger.info(f"Reusing already loaded model: {current_model_name}")
         return current_llm, current_model_name
 
     if current_model_name is not None:
-        logger.info("Switching model from %s to %s", current_model_name, target_model_name)
+        logger.info(f"Switching model from {current_model_name} to {target_model_name}")
     unload_vllm_model(current_llm)
     new_llm = load_vllm_model(target_model_name)
     return new_llm, target_model_name
@@ -146,12 +146,7 @@ def main():
                     body = decode_message_body(msg)
                     task, target_model_name = resolve_task(body, default_model_name)
 
-                    logger.info(
-                        "Processing message id %s with task=%s model=%s",
-                        msg.message_id,
-                        task,
-                        target_model_name,
-                    )
+                    logger.info(f"Processing message id {msg.message_id} with task={task} model={target_model_name}")
 
                     current_llm, current_model_name = ensure_model_loaded(
                         current_llm,
@@ -164,15 +159,15 @@ def main():
                     else:
                         result_text = run_generate(current_llm, body)
 
-                    logger.info("Result [%s|%s]: %s", task, target_model_name, result_text)
+                    logger.info(f"Result [{task}|{target_model_name}]: {result_text}")
                     # TODO: Push result to output topic/database here.
                     
                     # Complete message to remove it from the queue
                     receiver.complete_message(msg)
-                    logger.info("Successfully processed and completed message id %s", msg.message_id)
+                    logger.info(f"Successfully processed and completed message id {msg.message_id}")
 
                 except Exception as e:
-                    logger.error("Error processing message: %s", e, exc_info=True)
+                    logger.error(f"Error processing message: {e}", exc_info=True)
                     # Abandon message so it can be retried or dead-lettered
                     receiver.abandon_message(msg)
 
