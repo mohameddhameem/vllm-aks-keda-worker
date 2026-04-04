@@ -1,0 +1,2 @@
+{"custom_id": "req-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "openai/whisper-large-v3", "messages": [{"role": "user", "content": [{"type": "text", "text": "Transcribe this audio."}, {"type": "audio", "audio_url": "file:///workspace/sample1.wav"}]}]}}
+{"custom_id": "req-2", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "openai/whisper-large-v3", "messages": [{"role": "user", "content": [{"type": "text", "text": "Transcribe this audio."}, {"type": "audio", "audio_url": "file:///workspace/sample2.wav"}]}]}}

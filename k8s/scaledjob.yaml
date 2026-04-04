@@ -1,0 +1,59 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: vllm-whisper-batch-job
+  namespace: vllm-speech
+spec:
+  jobTargetRef:
+    parallelism: 1
+    completions: 1
+    template:
+      spec:
+        containers:
+        - name: vllm-worker
+          image: your-acr-repo.azurecr.io/vllm-whisper-batch:latest
+          # Runs `python /workspace/src/worker.py` implicitly as entrypoint
+          env:
+          - name: SERVICEBUS_CONNECTION_STRING
+            valueFrom:
+              secretKeyRef:
+                name: service-bus-secrets
+                key: connection-string
+          - name: SERVICEBUS_QUEUE_NAME
+            value: "audio-transcription-queue"
+          - name: MODEL_NAME
+            value: "openai/whisper-large-v3"
+          volumeMounts:
+          - name: huggingface-cache
+            mountPath: /root/.cache/huggingface
+          # Depending on your cluster storage, you'd mount the audio files here
+          - name: shared-audio-volume
+            mountPath: /workspace/audio
+          resources:
+            limits:
+              nvidia.com/gpu: "1"  # Requires GPU nodes
+              memory: "16Gi"
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "8Gi"
+        volumes:
+        - name: huggingface-cache
+          emptyDir: {}
+        - name: shared-audio-volume
+          persistentVolumeClaim:
+            claimName: my-azure-file-share-pvc
+        restartPolicy: Never
+  pollingInterval: 15
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  maxReplicaCount: 5 # Scale up to 5 GPU nodes concurrently based on queue length
+  scalingStrategy:
+    strategy: "default"
+  triggers:
+  - type: azure-servicebus
+    metadata:
+      queueName: "audio-transcription-queue"
+      # One job spun up per 10 items in the queue
+      messageCount: "10"
+    authenticationRef:
+      name: azure-servicebus-auth
