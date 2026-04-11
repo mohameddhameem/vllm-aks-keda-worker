@@ -60,7 +60,7 @@ def test_resolve_task_rejects_unsupported_task():
 def test_ensure_model_loaded_reuses_same_model():
     llm = MagicMock()
     out_llm, out_model = worker.ensure_model_loaded(
-        llm, "openai/whisper-large-v3", "openai/whisper-large-v3"
+        llm, "openai/whisper-large-v3", "openai/whisper-large-v3", device="cuda"
     )
     assert out_llm is llm
     assert out_model == "openai/whisper-large-v3"
@@ -74,11 +74,11 @@ def test_ensure_model_loaded_switches_model(mock_unload, mock_load):
     mock_load.return_value = new_llm
 
     out_llm, out_model = worker.ensure_model_loaded(
-        old_llm, "openai/whisper-large-v3", "Qwen/Qwen2.5-7B-Instruct"
+        old_llm, "openai/whisper-large-v3", "Qwen/Qwen2.5-7B-Instruct", device="cuda"
     )
 
     mock_unload.assert_called_once_with(old_llm)
-    mock_load.assert_called_once_with("Qwen/Qwen2.5-7B-Instruct")
+    mock_load.assert_called_once_with("Qwen/Qwen2.5-7B-Instruct", device="cuda")
     assert out_llm is new_llm
     assert out_model == "Qwen/Qwen2.5-7B-Instruct"
 
@@ -98,7 +98,7 @@ def test_run_transcription_uses_optional_prompt_default():
 @patch("worker.torch.cuda")
 def test_get_target_memory_utilization_no_gpu(mock_cuda):
     mock_cuda.is_available.return_value = False
-    ratio = worker.get_target_memory_utilization(0.30)
+    ratio = worker.get_target_memory_utilization(device="cuda", target_ratio=0.30)
     assert ratio == 0.30
 
 
@@ -107,7 +107,7 @@ def test_get_target_memory_utilization_sufficient_memory(mock_cuda):
     mock_cuda.is_available.return_value = True
     mock_cuda.current_device.return_value = 0
     mock_cuda.mem_get_info.return_value = (8_000_000_000, 10_000_000_000)
-    ratio = worker.get_target_memory_utilization(0.30)
+    ratio = worker.get_target_memory_utilization(device="cuda", target_ratio=0.30)
     assert ratio == 0.30
 
 
@@ -116,23 +116,45 @@ def test_get_target_memory_utilization_constrained_memory(mock_cuda):
     mock_cuda.is_available.return_value = True
     mock_cuda.current_device.return_value = 0
     mock_cuda.mem_get_info.return_value = (2_500_000_000, 10_000_000_000)
-    ratio = worker.get_target_memory_utilization(0.30)
+    ratio = worker.get_target_memory_utilization(device="cuda", target_ratio=0.30)
     assert abs(ratio - 0.20) < 0.001
+
+
+def test_get_target_memory_utilization_cpu():
+    """CPU mode returns conservative 20% utilization."""
+    result = worker.get_target_memory_utilization(device="cpu")
+    assert result == 0.20
 
 
 @patch("worker.get_target_memory_utilization")
 @patch("worker.LLM")
-def test_load_vllm_model(mock_llm, mock_get_util):
+def test_load_vllm_model_gpu(mock_llm, mock_get_util):
     mock_get_util.return_value = 0.25
     model_name = "test/fake-model"
 
-    worker.load_vllm_model(model_name)
+    worker.load_vllm_model(model_name, device="cuda")
 
     mock_llm.assert_called_once_with(
         model=model_name,
         trust_remote_code=True,
+        device="cuda",
         gpu_memory_utilization=0.25,
         limit_mm_per_prompt={"audio": 1},
+    )
+
+
+@patch("worker.get_target_memory_utilization")
+@patch("worker.LLM")
+def test_load_vllm_model_cpu(mock_llm, mock_get_util):
+    mock_get_util.return_value = 0.20
+    model_name = "test/fake-model"
+
+    worker.load_vllm_model(model_name, device="cpu")
+
+    mock_llm.assert_called_once_with(
+        model=model_name,
+        trust_remote_code=True,
+        device="cpu",
     )
 
 
@@ -188,10 +210,12 @@ def test_safe_dead_letter_truncates_and_calls_receiver():
     {"SERVICEBUS_CONNECTION_STRING": "Endpoint=sb://x/", "SERVICEBUS_QUEUE_NAME": "q", "MODEL_NAME": "m"},
     clear=True,
 )
+@patch("worker.get_device_from_env")
 @patch("worker.ServiceBusClient.from_connection_string")
 @patch("worker.unload_vllm_model")
 @patch("worker.ensure_model_loaded")
-def test_main_non_retryable_goes_dead_letter(mock_ensure_loaded, mock_unload, mock_from_conn):
+def test_main_non_retryable_goes_dead_letter(mock_ensure_loaded, mock_unload, mock_from_conn, mock_get_device):
+    mock_get_device.return_value = "cuda"
     msg = _make_msg("nr1", {"task": "generate"})
     client_cm, receiver = _build_servicebus_mocks([msg])
 
@@ -211,13 +235,15 @@ def test_main_non_retryable_goes_dead_letter(mock_ensure_loaded, mock_unload, mo
     {"SERVICEBUS_CONNECTION_STRING": "Endpoint=sb://x/", "SERVICEBUS_QUEUE_NAME": "q", "MODEL_NAME": "m"},
     clear=True,
 )
+@patch("worker.get_device_from_env")
 @patch("worker.ServiceBusClient.from_connection_string")
 @patch("worker.unload_vllm_model")
 @patch("worker.ensure_model_loaded")
 @patch("worker.run_generate")
 def test_main_retryable_goes_abandon(
-    mock_run_generate, mock_ensure_loaded, mock_unload, mock_from_conn
+    mock_run_generate, mock_ensure_loaded, mock_unload, mock_from_conn, mock_get_device
 ):
+    mock_get_device.return_value = "cuda"
     msg = _make_msg("r1", {"task": "generate", "prompt": "hello"})
     client_cm, receiver = _build_servicebus_mocks([msg])
 
@@ -238,9 +264,11 @@ def test_main_retryable_goes_abandon(
     {"SERVICEBUS_CONNECTION_STRING": "Endpoint=sb://x/", "SERVICEBUS_QUEUE_NAME": "q", "MODEL_NAME": "m"},
     clear=True,
 )
+@patch("worker.get_device_from_env")
 @patch("worker.ServiceBusClient.from_connection_string")
 @patch("worker.unload_vllm_model")
-def test_main_malformed_json_goes_dead_letter(mock_unload, mock_from_conn):
+def test_main_malformed_json_goes_dead_letter(mock_unload, mock_from_conn, mock_get_device):
+    mock_get_device.return_value = "cuda"
     msg = _make_msg("badjson", [b"{not-valid-json"])
     client_cm, receiver = _build_servicebus_mocks([msg])
 
@@ -259,3 +287,44 @@ def test_main_malformed_json_goes_dead_letter(mock_unload, mock_from_conn):
 def test_main_missing_env_returns_early(mock_from_conn):
     worker.main()
     mock_from_conn.assert_not_called()
+
+
+def test_detect_device_with_gpu():
+    """Detect GPU when available."""
+    with patch("worker.torch.cuda.is_available", return_value=True):
+        with patch("worker.torch.cuda.device_count", return_value=1):
+            with patch("worker.torch.cuda.get_device_name", return_value="NVIDIA GeForce RTX 3080"):
+                result = worker.detect_device()
+                assert result == "cuda"
+
+
+def test_detect_device_without_gpu():
+    """Fallback to CPU when GPU not available."""
+    with patch("worker.torch.cuda.is_available", return_value=False):
+        result = worker.detect_device()
+        assert result == "cpu"
+
+
+def test_get_device_from_env_auto():
+    """Auto-detect device when DEVICE=auto."""
+    with patch.dict(os.environ, {"DEVICE": "auto"}):
+        with patch("worker.torch.cuda.is_available", return_value=True):
+            with patch("worker.torch.cuda.device_count", return_value=1):
+                with patch("worker.torch.cuda.get_device_name", return_value="GPU"):
+                    result = worker.get_device_from_env()
+                    assert result == "cuda"
+
+
+def test_get_device_from_env_cpu_explicit():
+    """Use CPU when explicitly requested."""
+    with patch.dict(os.environ, {"DEVICE": "cpu"}):
+        result = worker.get_device_from_env()
+        assert result == "cpu"
+
+
+def test_get_device_from_env_cuda_fallback():
+    """Fallback to CPU when CUDA requested but unavailable."""
+    with patch.dict(os.environ, {"DEVICE": "cuda"}):
+        with patch("worker.torch.cuda.is_available", return_value=False):
+            result = worker.get_device_from_env()
+            assert result == "cpu"

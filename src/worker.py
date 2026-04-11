@@ -3,7 +3,7 @@ import gc
 import json
 import torch
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Literal
 from azure.servicebus import ServiceBusClient
 from vllm import LLM, SamplingParams
 from vllm.distributed.parallel_state import destroy_model_parallel
@@ -24,12 +24,72 @@ NON_RETRYABLE_EXCEPTIONS = (
 )
 
 
-def get_target_memory_utilization(target_ratio: float = 0.30) -> float:
+def detect_device() -> Literal["cuda", "cpu"]:
+    """Detect available device.
+    
+    Returns:
+        'cuda' if GPU is available, 'cpu' otherwise.
+    """
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        logger.info(f"GPU available: {gpu_count} device(s)")
+        for i in range(gpu_count):
+            logger.info(f"  Device {i}: {torch.cuda.get_device_name(i)}")
+        return "cuda"
+    else:
+        logger.info("No GPU detected. Using CPU mode.")
+        return "cpu"
+
+
+def get_device_from_env() -> Literal["cuda", "cpu"]:
+    """Get device from environment variable or auto-detect.
+    
+    Environment variable: DEVICE (default: auto)
+    Valid values: 'cuda', 'cpu', 'auto'
+    
+    Returns:
+        The selected device.
+    """
+    device_env = os.getenv("DEVICE", "auto").lower()
+    if device_env == "auto":
+        return detect_device()
+    elif device_env in ("cuda", "gpu"):
+        if torch.cuda.is_available():
+            return "cuda"
+        else:
+            logger.warning("GPU requested but not available. Falling back to CPU.")
+            return "cpu"
+    elif device_env == "cpu":
+        return "cpu"
+    else:
+        logger.warning(f"Unknown device: {device_env}. Auto-detecting.")
+        return detect_device()
+
+
+def get_target_memory_utilization(device: Literal["cuda", "cpu"], target_ratio: float = 0.30) -> float:
+    """Get optimal memory utilization ratio for the given device.
+    
+    For GPU: Uses actual VRAM to compute safe utilization.
+    For CPU: Uses a lower default ratio since CPU memory is shared.
+    
+    Args:
+        device: The device to get memory utilization for.
+        target_ratio: Target GPU utilization ratio. Ignored on CPU.
+    
+    Returns:
+        The memory utilization ratio to use.
+    """
+    if device == "cpu":
+        # CPU mode: use conservative defaults since CPU memory is shared with OS
+        cpu_target = 0.20  # 20% is safer for CPU-only inference
+        logger.info(f"CPU mode: Using conservative memory utilization: {cpu_target:.1%}")
+        return cpu_target
+
     if not torch.cuda.is_available():
         return target_ratio
 
-    device = torch.cuda.current_device()
-    free_memory, total_memory = torch.cuda.mem_get_info(device)
+    gpu_device = torch.cuda.current_device()
+    free_memory, total_memory = torch.cuda.mem_get_info(gpu_device)
     free_ratio = free_memory / total_memory
 
     logger.info(
@@ -52,20 +112,40 @@ def get_target_memory_utilization(target_ratio: float = 0.30) -> float:
     return safe_ratio
 
 
-def load_vllm_model(model_name: str):
-    utilization_ratio = get_target_memory_utilization(target_ratio=0.30)
+def load_vllm_model(model_name: str, device: Literal["cuda", "cpu"] = "cuda"):
+    """Load a vLLM model with device-aware configuration.
+    
+    Args:
+        model_name: HuggingFace model identifier.
+        device: Device to load model on ('cuda' or 'cpu').
+    
+    Returns:
+        Loaded LLM instance.
+    """
+    utilization_ratio = get_target_memory_utilization(device, target_ratio=0.30)
     logger.info(
-        "Loading vLLM model %s with gpu_memory_utilization=%.2f...",
+        "Loading vLLM model %s on device=%s with memory_utilization=%.2f...",
         model_name,
+        device,
         utilization_ratio,
     )
-    return LLM(
-        model=model_name,
-        trust_remote_code=True,
-        gpu_memory_utilization=utilization_ratio,
+
+    llm_config = {
+        "model": model_name,
+        "trust_remote_code": True,
+        "device": device,
+    }
+
+    # GPU-specific settings
+    if device == "cuda":
+        llm_config["gpu_memory_utilization"] = utilization_ratio
         # Default limits for audio capabilities (ignored safely by text models).
-        limit_mm_per_prompt={"audio": 1},
-    )
+        llm_config["limit_mm_per_prompt"] = {"audio": 1}
+    else:
+        # CPU mode: minimal config for stability
+        logger.info("CPU mode: Running in CPU-only inference (slower but lower resource usage).")
+
+    return LLM(**llm_config)
 
 
 def unload_vllm_model(llm_instance: Optional[Any]) -> None:
@@ -140,7 +220,19 @@ def ensure_model_loaded(
     current_llm: Optional[Any],
     current_model_name: Optional[str],
     target_model_name: str,
+    device: Literal["cuda", "cpu"] = "cuda",
 ) -> Tuple[Any, str]:
+    """Ensure target model is loaded, switching if needed.
+    
+    Args:
+        current_llm: Currently loaded model instance.
+        current_model_name: Name of currently loaded model.
+        target_model_name: Name of model to load.
+        device: Device to use for loading.
+    
+    Returns:
+        Tuple of (loaded_llm_instance, loaded_model_name).
+    """
     if current_model_name == target_model_name and current_llm is not None:
         logger.info("Reusing already loaded model: %s", current_model_name)
         return current_llm, current_model_name
@@ -149,7 +241,7 @@ def ensure_model_loaded(
         logger.info("Switching model from %s to %s", current_model_name, target_model_name)
 
     unload_vllm_model(current_llm)
-    new_llm = load_vllm_model(target_model_name)
+    new_llm = load_vllm_model(target_model_name, device=device)
     return new_llm, target_model_name
 
 
@@ -186,14 +278,17 @@ def safe_dead_letter(receiver: Any, msg: Any, reason: str, description: str) -> 
 
 
 def main() -> None:
+    # Configuration from environment
     connection_str = os.getenv("SERVICEBUS_CONNECTION_STRING")
     queue_name = os.getenv("SERVICEBUS_QUEUE_NAME")
     default_model_name = os.getenv("MODEL_NAME", "openai/whisper-large-v3")
+    device = get_device_from_env()
 
     if not connection_str or not queue_name:
         logger.error("Missing Service Bus connection environment variables.")
         return
 
+    logger.info(f"Worker initialized with device={device}")
     logger.info("Connecting to Azure Service Bus...")
 
     current_llm = None
@@ -208,16 +303,18 @@ def main() -> None:
                         task, target_model_name = resolve_task(body, default_model_name)
 
                         logger.info(
-                            "Processing message id %s with task=%s model=%s",
+                            "Processing message id %s with task=%s model=%s device=%s",
                             msg.message_id,
                             task,
                             target_model_name,
+                            device,
                         )
 
                         current_llm, current_model_name = ensure_model_loaded(
                             current_llm,
                             current_model_name,
                             target_model_name,
+                            device,
                         )
 
                         if task == "transcription":

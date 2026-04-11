@@ -1,0 +1,26 @@
+# CPU-only vLLM Worker
+# Use base Python image instead of vllm GPU base
+FROM python:3.11-slim
+
+# Install system dependencies required for handling audio and inference
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and install python dependencies (CPU mode)
+COPY requirements.txt /workspace/requirements.txt
+RUN pip install --no-cache-dir \
+    -r /workspace/requirements.txt \
+    vllm[cpu]
+
+# Copy the worker script
+COPY src/worker.py /workspace/src/worker.py
+
+# Set device to CPU
+ENV DEVICE=cpu
+
+# Keep backwards compatibility for manually running the `vllm run-batch`
+# or defaulting to our new queue processor when running as KEDA ScaledJob
+ENTRYPOINT ["python", "/workspace/src/worker.py"]
